@@ -1,0 +1,9 @@
+service: () -> {
+    create_user: (record {email:text; first_name:text; last_name:text; phone_number:text}) -> (variant {Ok:record {id:text; username:text; balance:nat64; created_at:text; email:text; first_name:text; last_name:text; phone_number:text; points:nat64}; Err:variant {Error:text; InvalidPayload:text; NotFound:text; Success:text; Unauthorized:text}});
+    deposit_funds: (record {user_id:text; amount:nat64}) -> (variant {Ok:variant {Error:text; InvalidPayload:text; NotFound:text; Success:text; Unauthorized:text}; Err:variant {Error:text; InvalidPayload:text; NotFound:text; Success:text; Unauthorized:text}});
+    get_transaction_history: (nat64) -> (variant {Ok:vec record {id:text; to_user_id:text; created_at:text; from_user_id:text; amount:nat64}; Err:variant {Error:text; InvalidPayload:text; NotFound:text; Success:text; Unauthorized:text}}) query;
+    get_user_balance: (nat64) -> (variant {Ok:nat64; Err:variant {Error:text; InvalidPayload:text; NotFound:text; Success:text; Unauthorized:text}}) query;
+    get_user_points: (nat64) -> (variant {Ok:nat64; Err:variant {Error:text; InvalidPayload:text; NotFound:text; Success:text; Unauthorized:text}}) query;
+    redeem_points: (record {user_id:text; points:nat64}) -> (variant {Ok:variant {Error:text; InvalidPayload:text; NotFound:text; Success:text; Unauthorized:text}; Err:variant {Error:text; InvalidPayload:text; NotFound:text; Success:text; Unauthorized:text}});
+    send_transaction: (record {to_user_id:text; from_user_id:text; amount:nat64}) -> (variant {Ok:record {id:text; to_user_id:text; created_at:text; from_user_id:text; amount:nat64}; Err:variant {Error:text; InvalidPayload:text; NotFound:text; Success:text; Unauthorized:text}});
+}
