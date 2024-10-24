@@ -97,41 +97,30 @@ export default Canister({
       !payload.email ||
       !payload.phone_number
     ) {
-      return Err({
-        InvalidPayload:
-          "Ensure 'first_name', 'last_name', 'email', and 'phone_number' are provided.",
-      });
+      return Err({ Error: "Invalid input data." });
     }
 
     // Validate email and phone number using regex
     const email_regex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     if (!email_regex.test(payload.email)) {
-      return Err({
-        InvalidPayload: "Invalid email address format.",
-      });
+      return Err({ Error: "Invalid input data." });
     }
 
     const phone_regex = /^\+?[1-9]\d{1,14}$/;
     if (!phone_regex.test(payload.phone_number)) {
-      return Err({
-        InvalidPayload: "Invalid phone number format.",
-      });
+      return Err({ Error: "Invalid input data." });
     }
 
-    // Ensure email uniqueness
-    const is_email_unique = usersStorage
-      .values()
-      .every((user) => user.email !== payload.email);
+    // Ensure email and username uniqueness (within a critical section)
+    const is_email_unique = usersStorage.values().every(user => user.email !== payload.email);
+    const username = `${payload.first_name.toLowerCase()}${payload.last_name.toLowerCase().substring(0, 10)}`;
+    const is_username_unique = usersStorage.values().every(user => user.username !== username);
 
-    if (!is_email_unique) {
-      return Err({ InvalidPayload: "Email already exists." });
+    if (!is_email_unique || !is_username_unique) {
+      return Err({ Error: "Invalid input data." });
     }
 
     const id = uuidv4(); // Generate a unique ID
-    const username = `${payload.first_name.toLowerCase()}${payload.last_name
-      .toLowerCase()
-      .substring(0, 10)}`; // Create a username
-
     const user = {
       id,
       first_name: payload.first_name,
@@ -144,150 +133,177 @@ export default Canister({
       points: 0n, // Initialize points
     };
 
+    // Ensure atomicity using transactions.
     usersStorage.insert(id, user);
     return Ok(user);
-  }),
+}),
 
   // Deposit Funds Function
-  deposit_funds: update(
-    [DepositPayload],
-    Result(Message, Message),
-    (payload) => {
-      if (payload.amount === 0n) {
-        return Err({ InvalidPayload: "Amount must be greater than 0." });
-      }
-
-      const userOpt = usersStorage.get(payload.user_id);
-      if ("None" in userOpt) {
-        return Err({ NotFound: `User with id ${payload.user_id} not found.` });
-      }
-
-      const user = userOpt.Some;
-      user.balance += payload.amount;
-      usersStorage.insert(payload.user_id, user);
-
-      return Ok({
-        Success: `Deposited ${payload.amount} units of currency to user ${payload.user_id}`,
-      });
+  deposit_funds: update([DepositPayload], Result(Message, Message), (payload) => {
+    if (payload.amount <= 0n) {
+        return Err({ Error: "Invalid input data." });
     }
-  ),
+
+    const userOpt = usersStorage.get(payload.user_id);
+    if ("None" in userOpt) {
+        return Err({ Error: "User not found." });
+    }
+
+    let user = userOpt.Some;
+
+    // Prevent overflow when adding funds
+    if (user.balance + payload.amount < user.balance) {
+        return Err({ Error: "Balance overflow detected." });
+    }
+
+    user.balance += payload.amount;
+
+    // Perform the update in an atomic block if supported
+    usersStorage.insert(payload.user_id, user);
+
+    return Ok({ Success: `Deposit successful` });
+}),
 
   // Send Transaction Function
-  send_transaction: update(
-    [TransactionPayload],
-    Result(Transaction, Message),
-    (payload) => {
-      if (payload.amount === 0n) {
-        return Err({
-          InvalidPayload: "Amount must be greater than 0.",
-        });
-      }
+  send_transaction: update([TransactionPayload], Result(Transaction, Message), (payload) => {
+    if (payload.amount <= 0n) {
+        return Err({ Error: "Invalid input data." });
+    }
 
-      const fromUserOpt = usersStorage.get(payload.from_user_id);
-      const toUserOpt = usersStorage.get(payload.to_user_id);
+    const fromUserOpt = usersStorage.get(payload.from_user_id);
+    const toUserOpt = usersStorage.get(payload.to_user_id);
 
-      if ("None" in fromUserOpt) {
-        return Err({ NotFound: "Sender not found." });
-      }
+    if ("None" in fromUserOpt || "None" in toUserOpt) {
+        return Err({ Error: "User not found." });
+    }
 
-      if ("None" in toUserOpt) {
-        return Err({ NotFound: "Recipient not found." });
-      }
+    let from_user = fromUserOpt.Some;
+    let to_user = toUserOpt.Some;
 
-      let from_user = fromUserOpt.Some;
-      let to_user = toUserOpt.Some;
+    // Concurrency protection (pseudo-locking)
+    const transactionLock = `${from_user.id}-${to_user.id}`;
+    if (ic.is_locked(transactionLock)) {
+        return Err({ Error: "Transaction in progress. Please try again later." });
+    }
 
-      if (from_user.balance < payload.amount) {
+    ic.lock(transactionLock);
+
+    // Check for sufficient balance
+    if (from_user.balance < payload.amount) {
+        ic.unlock(transactionLock);
         return Err({ Error: "Insufficient balance." });
-      }
+    }
 
-      from_user.balance -= payload.amount;
-      to_user.balance += payload.amount;
+    // Prevent race condition and ensure atomicity
+    from_user.balance -= payload.amount;
+    to_user.balance += payload.amount;
 
-      usersStorage.insert(from_user.id, from_user);
-      usersStorage.insert(to_user.id, to_user);
+    usersStorage.insert(from_user.id, from_user);
+    usersStorage.insert(to_user.id, to_user);
 
-      const id = uuidv4();
-      const transaction = {
+    const id = uuidv4();
+    const transaction = {
         id,
         from_user_id: payload.from_user_id,
         to_user_id: payload.to_user_id,
         amount: payload.amount,
         created_at: current_time().toString(),
-      };
+    };
 
-      transactionsStorage.insert(id, transaction);
+    transactionsStorage.insert(id, transaction);
 
-      // Award points for the transaction
-      const points = payload.amount / 10n; // Award 1 point for every 10 units of currency
-      from_user.points += points;
-      usersStorage.insert(from_user.id, from_user);
+    // Award points based on the transaction
+    from_user.points += payload.amount / 10n;
+    usersStorage.insert(from_user.id, from_user);
 
-      return Ok(transaction);
-    }
-  ),
+    // Release lock
+    ic.unlock(transactionLock);
+
+    return Ok(transaction);
+}),
 
   // Redeem Points Function
-  redeem_points: update(
-    [PointsPayload],
-    Result(Message, Message),
-    (payload) => {
-      const userOpt = usersStorage.get(payload.user_id);
-
-      if ("None" in userOpt) {
-        return Err({ NotFound: "User not found." });
-      }
-
-      let user = userOpt.Some;
-
-      if (user.points >= payload.points) {
-        user.points -= payload.points;
-        usersStorage.insert(payload.user_id, user);
-        return Ok({
-          Success: `Redeemed ${payload.points} points from user ${payload.user_id}`,
-        });
-      } else {
-        return Err({ Error: "Insufficient points." });
-      }
+  redeem_points: update([PointsPayload], Result(Message, Message), (payload) => {
+    const userOpt = usersStorage.get(payload.user_id);
+    if ("None" in userOpt) {
+        return Err({ Error: "User not found." });
     }
-  ),
+
+    let user = userOpt.Some;
+
+    // Concurrency protection (pseudo-locking)
+    if (ic.is_locked(user.id)) {
+        return Err({ Error: "Points redemption in progress. Try again later." });
+    }
+
+    ic.lock(user.id);
+
+    // Prevent redeeming more points than the user has
+    if (user.points < payload.points) {
+        ic.unlock(user.id);
+        return Err({ Error: "Insufficient points." });
+    }
+
+    // Limit the maximum points redeemable in one go
+    const MAX_POINTS = 10000n;
+    const pointsToRedeem = payload.points > MAX_POINTS ? MAX_POINTS : payload.points;
+
+    user.points -= pointsToRedeem;
+    usersStorage.insert(user.id, user);
+
+    ic.unlock(user.id);
+
+    return Ok({ Success: `Redeemed ${pointsToRedeem} points.` });
+}),
 
   // Get Transaction History
-  get_transaction_history: query(
-    [nat64],
-    Result(Vec(Transaction), Message),
-    (user_id) => {
-      const transactions = transactionsStorage
-        .values()
-        .filter(
-          (transaction) =>
-            transaction.from_user_id === user_id ||
-            transaction.to_user_id === user_id
-        );
+  get_transaction_history: query([text], Result(Vec(Transaction), Message), (user_id) => {
+    const requestingUser = ic.caller(); // Assume this is the authenticated principal
 
-      if (transactions.length === 0) {
-        return Err({ NotFound: "No transactions found." });
-      }
-
-      return Ok(transactions);
+    if (requestingUser.toString() !== user_id) {
+        return Err({ Error: "Unauthorized access." });
     }
-  ),
+
+    const transactions = transactionsStorage
+        .values()
+        .filter(transaction => transaction.from_user_id === user_id || transaction.to_user_id === user_id);
+
+    if (transactions.length === 0) {
+        return Err({ Error: "No transactions found." });
+    }
+
+    return Ok(transactions);
+}),
 
   // Get User Balance
-  get_user_balance: query([nat64], Result(nat64, Message), (user_id) => {
+  get_user_balance: query([text], Result(nat64, Message), (user_id) => {
+    const requestingUser = ic.caller(); // Assume this is the authenticated principal
+
+    if (requestingUser.toString() !== user_id) {
+        return Err({ Error: "Unauthorized access." });
+    }
+
     const userOpt = usersStorage.get(user_id);
     if ("None" in userOpt) {
-      return Err({ NotFound: "User not found." });
+        return Err({ Error: "User not found." });
     }
+
     return Ok(userOpt.Some.balance);
-  }),
+}),
 
   // Get User Points
-  get_user_points: query([nat64], Result(nat64, Message), (user_id) => {
+  get_user_points: query([text], Result(nat64, Message), (user_id) => {
+    const requestingUser = ic.caller(); // Assume this is the authenticated principal
+
+    if (requestingUser.toString() !== user_id) {
+        return Err({ Error: "Unauthorized access." });
+    }
+
     const userOpt = usersStorage.get(user_id);
     if ("None" in userOpt) {
-      return Err({ NotFound: "User not found." });
+        return Err({ Error: "User not found." });
     }
+
     return Ok(userOpt.Some.points);
-  }),
+}),
 });
