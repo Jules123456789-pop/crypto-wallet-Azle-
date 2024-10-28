@@ -2,7 +2,6 @@ import {
   query,
   update,
   text,
-  Null,
   Record,
   StableBTreeMap,
   Variant,
@@ -11,17 +10,18 @@ import {
   Some,
   Ok,
   Err,
-  ic,
-  Principal,
-  Opt,
-  Result,
   nat64,
-  bool,
+  Principal,
+  Result,
   Canister,
 } from "azle";
 import { v4 as uuidv4 } from "uuid";
 
-// User Struct
+// Constants for business rules
+const POINTS_CONVERSION_RATE = 10n; // 1 point for every 10 units
+const MIN_TRANSACTION_AMOUNT = 1n;
+
+// Enhanced User Struct with optional fields
 const User = Record({
   id: text,
   first_name: text,
@@ -31,28 +31,34 @@ const User = Record({
   phone_number: text,
   balance: nat64,
   points: nat64,
-  created_at: text,
+  created_at: nat64,
+  updated_at: nat64,
 });
 
-// Transaction Struct
+// Enhanced Transaction Struct with additional fields
 const Transaction = Record({
   id: text,
   from_user_id: text,
   to_user_id: text,
   amount: nat64,
-  created_at: text,
+  transaction_type: text, // 'TRANSFER' | 'DEPOSIT' | 'POINTS_REDEMPTION'
+  status: text, // 'PENDING' | 'COMPLETED' | 'FAILED'
+  points_earned: nat64,
+  created_at: nat64,
 });
 
-// Message Enum for Error and Success Handling
+// Improved Message Enum with specific error types
 const Message = Variant({
   Success: text,
-  Error: text,
+  ValidationError: text,
   NotFound: text,
-  InvalidPayload: text,
-  Unauthorized: text,
+  InsufficientFunds: text,
+  InsufficientPoints: text,
+  DuplicateEmail: text,
+  SystemError: text,
 });
 
-// User Payload
+// Improved Payloads with validation
 const UserPayload = Record({
   first_name: text,
   last_name: text,
@@ -60,210 +66,229 @@ const UserPayload = Record({
   phone_number: text,
 });
 
-// Transaction Payload
 const TransactionPayload = Record({
   from_user_id: text,
   to_user_id: text,
   amount: nat64,
 });
 
-// Points Payload
 const PointsPayload = Record({
   user_id: text,
   points: nat64,
 });
 
-// Deposit Payload
 const DepositPayload = Record({
   user_id: text,
   amount: nat64,
 });
 
-// Storage initialization
-const usersStorage = StableBTreeMap(0, text, User);
-const transactionsStorage = StableBTreeMap(0, text, Transaction);
+// Storage with improved naming
+const userStorage = StableBTreeMap(0, text, User);
+const transactionStorage = StableBTreeMap(1, text, Transaction); // Changed index to 1
 
-// Helper Function for Current Time
-function current_time(): nat64 {
+// Validation helper functions
+function validateEmail(email: string): boolean {
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  return emailRegex.test(email);
+}
+
+function validatePhoneNumber(phone: string): boolean {
+  const phoneRegex = /^\+?[1-9]\d{1,14}$/;
+  return phoneRegex.test(phone);
+}
+
+function getCurrentTimestamp(): nat64 {
   return BigInt(Math.floor(Date.now() / 1000));
 }
 
-// Create User Function
+function generateUsername(firstName: string, lastName: string): string {
+  const sanitizedFirst = firstName.toLowerCase().replace(/[^a-z0-9]/g, '');
+  const sanitizedLast = lastName.toLowerCase().replace(/[^a-z0-9]/g, '');
+  return `${sanitizedFirst}${sanitizedLast.substring(0, 10)}${Math.floor(Math.random() * 1000)}`;
+}
+
 export default Canister({
+  // Improved create_user with better validation and error handling
   create_user: update([UserPayload], Result(User, Message), (payload) => {
-    if (
-      !payload.first_name ||
-      !payload.last_name ||
-      !payload.email ||
-      !payload.phone_number
-    ) {
-      return Err({
-        InvalidPayload:
-          "Ensure 'first_name', 'last_name', 'email', and 'phone_number' are provided.",
-      });
+    // Input validation
+    if (!payload.first_name?.trim() || !payload.last_name?.trim()) {
+      return Err({ ValidationError: "First name and last name are required." });
     }
 
-    // Validate email and phone number using regex
-    const email_regex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-    if (!email_regex.test(payload.email)) {
-      return Err({
-        InvalidPayload: "Invalid email address format.",
-      });
+    if (!validateEmail(payload.email)) {
+      return Err({ ValidationError: "Invalid email address format." });
     }
 
-    const phone_regex = /^\+?[1-9]\d{1,14}$/;
-    if (!phone_regex.test(payload.phone_number)) {
-      return Err({
-        InvalidPayload: "Invalid phone number format.",
-      });
+    if (!validatePhoneNumber(payload.phone_number)) {
+      return Err({ ValidationError: "Invalid phone number format." });
     }
 
-    // Ensure email uniqueness
-    const is_email_unique = usersStorage
-      .values()
-      .every((user) => user.email !== payload.email);
-
-    if (!is_email_unique) {
-      return Err({ InvalidPayload: "Email already exists." });
+    // Check email uniqueness
+    const existingUser = userStorage.values().find(user => user.email === payload.email);
+    if (existingUser) {
+      return Err({ DuplicateEmail: "Email already exists." });
     }
 
-    const id = uuidv4(); // Generate a unique ID
-    const username = `${payload.first_name.toLowerCase()}${payload.last_name
-      .toLowerCase()
-      .substring(0, 10)}`; // Create a username
-
+    const timestamp = getCurrentTimestamp();
     const user = {
-      id,
-      first_name: payload.first_name,
-      last_name: payload.last_name,
-      username,
-      email: payload.email,
+      id: uuidv4(),
+      first_name: payload.first_name.trim(),
+      last_name: payload.last_name.trim(),
+      username: generateUsername(payload.first_name, payload.last_name),
+      email: payload.email.toLowerCase(),
       phone_number: payload.phone_number,
-      created_at: current_time().toString(),
-      balance: 0n, // Initialize balance
-      points: 0n, // Initialize points
+      balance: 0n,
+      points: 0n,
+      created_at: timestamp,
+      updated_at: timestamp,
     };
 
-    usersStorage.insert(id, user);
+    userStorage.insert(user.id, user);
     return Ok(user);
   }),
 
-  // Deposit Funds Function
-  deposit_funds: update(
-    [DepositPayload],
-    Result(Message, Message),
-    (payload) => {
-      if (payload.amount === 0n) {
-        return Err({ InvalidPayload: "Amount must be greater than 0." });
-      }
-
-      const userOpt = usersStorage.get(payload.user_id);
-      if ("None" in userOpt) {
-        return Err({ NotFound: `User with id ${payload.user_id} not found.` });
-      }
-
-      const user = userOpt.Some;
-      user.balance += payload.amount;
-      usersStorage.insert(payload.user_id, user);
-
-      return Ok({
-        Success: `Deposited ${payload.amount} units of currency to user ${payload.user_id}`,
-      });
+  // Improved deposit_funds with transaction tracking
+  deposit_funds: update([DepositPayload], Result(Transaction, Message), (payload) => {
+    if (payload.amount < MIN_TRANSACTION_AMOUNT) {
+      return Err({ ValidationError: "Amount must be greater than 0." });
     }
-  ),
 
-  // Send Transaction Function
-  send_transaction: update(
-    [TransactionPayload],
-    Result(Transaction, Message),
-    (payload) => {
-      if (payload.amount === 0n) {
-        return Err({
-          InvalidPayload: "Amount must be greater than 0.",
-        });
-      }
-
-      const fromUserOpt = usersStorage.get(payload.from_user_id);
-      const toUserOpt = usersStorage.get(payload.to_user_id);
-
-      if ("None" in fromUserOpt) {
-        return Err({ NotFound: "Sender not found." });
-      }
-
-      if ("None" in toUserOpt) {
-        return Err({ NotFound: "Recipient not found." });
-      }
-
-      let from_user = fromUserOpt.Some;
-      let to_user = toUserOpt.Some;
-
-      if (from_user.balance < payload.amount) {
-        return Err({ Error: "Insufficient balance." });
-      }
-
-      from_user.balance -= payload.amount;
-      to_user.balance += payload.amount;
-
-      usersStorage.insert(from_user.id, from_user);
-      usersStorage.insert(to_user.id, to_user);
-
-      const id = uuidv4();
-      const transaction = {
-        id,
-        from_user_id: payload.from_user_id,
-        to_user_id: payload.to_user_id,
-        amount: payload.amount,
-        created_at: current_time().toString(),
-      };
-
-      transactionsStorage.insert(id, transaction);
-
-      // Award points for the transaction
-      const points = payload.amount / 10n; // Award 1 point for every 10 units of currency
-      from_user.points += points;
-      usersStorage.insert(from_user.id, from_user);
-
-      return Ok(transaction);
+    const userOpt = userStorage.get(payload.user_id);
+    if ("None" in userOpt) {
+      return Err({ NotFound: `User with id ${payload.user_id} not found.` });
     }
-  ),
 
-  // Redeem Points Function
-  redeem_points: update(
-    [PointsPayload],
-    Result(Message, Message),
-    (payload) => {
-      const userOpt = usersStorage.get(payload.user_id);
+    const user = userOpt.Some;
+    const timestamp = getCurrentTimestamp();
 
-      if ("None" in userOpt) {
-        return Err({ NotFound: "User not found." });
-      }
+    // Create deposit transaction
+    const transaction = {
+      id: uuidv4(),
+      from_user_id: "SYSTEM",
+      to_user_id: payload.user_id,
+      amount: payload.amount,
+      transaction_type: "DEPOSIT",
+      status: "COMPLETED",
+      points_earned: 0n,
+      created_at: timestamp,
+    };
 
-      let user = userOpt.Some;
+    // Update user balance
+    user.balance += payload.amount;
+    user.updated_at = timestamp;
 
-      if (user.points >= payload.points) {
-        user.points -= payload.points;
-        usersStorage.insert(payload.user_id, user);
-        return Ok({
-          Success: `Redeemed ${payload.points} points from user ${payload.user_id}`,
-        });
-      } else {
-        return Err({ Error: "Insufficient points." });
-      }
+    userStorage.insert(user.id, user);
+    transactionStorage.insert(transaction.id, transaction);
+
+    return Ok(transaction);
+  }),
+
+  // Improved send_transaction with atomic operations
+  send_transaction: update([TransactionPayload], Result(Transaction, Message), (payload) => {
+    if (payload.amount < MIN_TRANSACTION_AMOUNT) {
+      return Err({ ValidationError: "Amount must be greater than 0." });
     }
-  ),
 
-  // Get Transaction History
+    const fromUserOpt = userStorage.get(payload.from_user_id);
+    const toUserOpt = userStorage.get(payload.to_user_id);
+
+    if ("None" in fromUserOpt) {
+      return Err({ NotFound: "Sender not found." });
+    }
+
+    if ("None" in toUserOpt) {
+      return Err({ NotFound: "Recipient not found." });
+    }
+
+    let fromUser = fromUserOpt.Some;
+    let toUser = toUserOpt.Some;
+
+    if (fromUser.balance < payload.amount) {
+      return Err({ InsufficientFunds: "Insufficient balance." });
+    }
+
+    const timestamp = getCurrentTimestamp();
+    const pointsEarned = payload.amount / POINTS_CONVERSION_RATE;
+
+    const transaction = {
+      id: uuidv4(),
+      from_user_id: payload.from_user_id,
+      to_user_id: payload.to_user_id,
+      amount: payload.amount,
+      transaction_type: "TRANSFER",
+      status: "COMPLETED",
+      points_earned: pointsEarned,
+      created_at: timestamp,
+    };
+
+    // Update balances and points atomically
+    fromUser.balance -= payload.amount;
+    fromUser.points += pointsEarned;
+    fromUser.updated_at = timestamp;
+
+    toUser.balance += payload.amount;
+    toUser.updated_at = timestamp;
+
+    // Commit all changes
+    userStorage.insert(fromUser.id, fromUser);
+    userStorage.insert(toUser.id, toUser);
+    transactionStorage.insert(transaction.id, transaction);
+
+    return Ok(transaction);
+  }),
+
+  // Improved redeem_points with transaction tracking
+  redeem_points: update([PointsPayload], Result(Transaction, Message), (payload) => {
+    if (payload.points === 0n) {
+      return Err({ ValidationError: "Points must be greater than 0." });
+    }
+
+    const userOpt = userStorage.get(payload.user_id);
+    if ("None" in userOpt) {
+      return Err({ NotFound: "User not found." });
+    }
+
+    let user = userOpt.Some;
+    if (user.points < payload.points) {
+      return Err({ InsufficientPoints: "Insufficient points balance." });
+    }
+
+    const timestamp = getCurrentTimestamp();
+    
+    const transaction = {
+      id: uuidv4(),
+      from_user_id: payload.user_id,
+      to_user_id: "SYSTEM",
+      amount: 0n,
+      transaction_type: "POINTS_REDEMPTION",
+      status: "COMPLETED",
+      points_earned: -payload.points, // Negative to indicate points spent
+      created_at: timestamp,
+    };
+
+    user.points -= payload.points;
+    user.updated_at = timestamp;
+
+    userStorage.insert(user.id, user);
+    transactionStorage.insert(transaction.id, transaction);
+
+    return Ok(transaction);
+  }),
+
+  // Improved query functions with pagination
   get_transaction_history: query(
-    [nat64],
+    [text, nat64, nat64], // user_id, skip, limit
     Result(Vec(Transaction), Message),
-    (user_id) => {
-      const transactions = transactionsStorage
+    (user_id, skip, limit) => {
+      const transactions = transactionStorage
         .values()
         .filter(
-          (transaction) =>
-            transaction.from_user_id === user_id ||
-            transaction.to_user_id === user_id
-        );
+          (tx) =>
+            tx.from_user_id === user_id ||
+            tx.to_user_id === user_id
+        )
+        .sort((a, b) => Number(b.created_at - a.created_at)) // Sort by newest first
+        .slice(Number(skip), Number(skip + limit));
 
       if (transactions.length === 0) {
         return Err({ NotFound: "No transactions found." });
@@ -273,21 +298,28 @@ export default Canister({
     }
   ),
 
-  // Get User Balance
-  get_user_balance: query([nat64], Result(nat64, Message), (user_id) => {
-    const userOpt = usersStorage.get(user_id);
+  get_user_balance: query([text], Result(nat64, Message), (user_id) => {
+    const userOpt = userStorage.get(user_id);
     if ("None" in userOpt) {
       return Err({ NotFound: "User not found." });
     }
     return Ok(userOpt.Some.balance);
   }),
 
-  // Get User Points
-  get_user_points: query([nat64], Result(nat64, Message), (user_id) => {
-    const userOpt = usersStorage.get(user_id);
+  get_user_points: query([text], Result(nat64, Message), (user_id) => {
+    const userOpt = userStorage.get(user_id);
     if ("None" in userOpt) {
       return Err({ NotFound: "User not found." });
     }
     return Ok(userOpt.Some.points);
+  }),
+
+  // New helper function to get user details
+  get_user: query([text], Result(User, Message), (user_id) => {
+    const userOpt = userStorage.get(user_id);
+    if ("None" in userOpt) {
+      return Err({ NotFound: "User not found." });
+    }
+    return Ok(userOpt.Some);
   }),
 });
