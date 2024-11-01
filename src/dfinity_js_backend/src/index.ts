@@ -83,9 +83,18 @@ const DepositPayload = Record({
 const usersStorage = StableBTreeMap(0, text, User);
 const transactionsStorage = StableBTreeMap(0, text, Transaction);
 
-// Helper Function for Current Time
-function current_time(): nat64 {
-  return BigInt(Math.floor(Date.now() / 1000));
+// Helper Function for Current Time in ISO 8601 Format
+function current_time(): string {
+  return new Date().toISOString();
+}
+
+// Extracted Helper Function for User Lookup
+function get_user(user_id: text): Result(User, Message) {
+  const userOpt = usersStorage.get(user_id);
+  if ("None" in userOpt) {
+    return Err({ NotFound: "User not found." });
+  }
+  return Ok(userOpt.Some);
 }
 
 // Create User Function
@@ -98,39 +107,34 @@ export default Canister({
       !payload.phone_number
     ) {
       return Err({
-        InvalidPayload:
-          "Ensure 'first_name', 'last_name', 'email', and 'phone_number' are provided.",
+        InvalidPayload: "Ensure 'first_name', 'last_name', 'email', and 'phone_number' are provided.",
       });
     }
 
     // Validate email and phone number using regex
     const email_regex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
     if (!email_regex.test(payload.email)) {
-      return Err({
-        InvalidPayload: "Invalid email address format.",
-      });
+      return Err({ InvalidPayload: "Invalid email address format." });
     }
 
     const phone_regex = /^\+?[1-9]\d{1,14}$/;
     if (!phone_regex.test(payload.phone_number)) {
-      return Err({
-        InvalidPayload: "Invalid phone number format.",
-      });
+      return Err({ InvalidPayload: "Invalid phone number format." });
     }
 
-    // Ensure email uniqueness
-    const is_email_unique = usersStorage
+    // Ensure username uniqueness
+    const username = `${payload.first_name.toLowerCase()}${payload.last_name
+      .toLowerCase()
+      .substring(0, 10)}`;
+    const is_username_unique = usersStorage
       .values()
-      .every((user) => user.email !== payload.email);
+      .every((user) => user.username !== username);
 
-    if (!is_email_unique) {
-      return Err({ InvalidPayload: "Email already exists." });
+    if (!is_username_unique) {
+      return Err({ InvalidPayload: "Username already exists." });
     }
 
     const id = uuidv4(); // Generate a unique ID
-    const username = `${payload.first_name.toLowerCase()}${payload.last_name
-      .toLowerCase()
-      .substring(0, 10)}`; // Create a username
 
     const user = {
       id,
@@ -139,7 +143,7 @@ export default Canister({
       username,
       email: payload.email,
       phone_number: payload.phone_number,
-      created_at: current_time().toString(),
+      created_at: current_time(),
       balance: 0n, // Initialize balance
       points: 0n, // Initialize points
     };
@@ -153,16 +157,16 @@ export default Canister({
     [DepositPayload],
     Result(Message, Message),
     (payload) => {
-      if (payload.amount === 0n) {
+      if (payload.amount <= 0n) {
         return Err({ InvalidPayload: "Amount must be greater than 0." });
       }
 
-      const userOpt = usersStorage.get(payload.user_id);
-      if ("None" in userOpt) {
-        return Err({ NotFound: `User with id ${payload.user_id} not found.` });
+      const userResult = get_user(payload.user_id);
+      if ("Err" in userResult) {
+        return userResult; // Return error if user not found
       }
 
-      const user = userOpt.Some;
+      const user = userResult.Ok;
       user.balance += payload.amount;
       usersStorage.insert(payload.user_id, user);
 
@@ -177,25 +181,23 @@ export default Canister({
     [TransactionPayload],
     Result(Transaction, Message),
     (payload) => {
-      if (payload.amount === 0n) {
-        return Err({
-          InvalidPayload: "Amount must be greater than 0.",
-        });
+      if (payload.amount <= 0n) {
+        return Err({ InvalidPayload: "Amount must be greater than 0." });
       }
 
-      const fromUserOpt = usersStorage.get(payload.from_user_id);
-      const toUserOpt = usersStorage.get(payload.to_user_id);
+      const from_user_result = get_user(payload.from_user_id);
+      const to_user_result = get_user(payload.to_user_id);
 
-      if ("None" in fromUserOpt) {
-        return Err({ NotFound: "Sender not found." });
+      if ("Err" in from_user_result) {
+        return from_user_result; // Return error if sender not found
       }
 
-      if ("None" in toUserOpt) {
-        return Err({ NotFound: "Recipient not found." });
+      if ("Err" in to_user_result) {
+        return to_user_result; // Return error if recipient not found
       }
 
-      let from_user = fromUserOpt.Some;
-      let to_user = toUserOpt.Some;
+      const from_user = from_user_result.Ok;
+      const to_user = to_user_result.Ok;
 
       if (from_user.balance < payload.amount) {
         return Err({ Error: "Insufficient balance." });
@@ -213,7 +215,7 @@ export default Canister({
         from_user_id: payload.from_user_id,
         to_user_id: payload.to_user_id,
         amount: payload.amount,
-        created_at: current_time().toString(),
+        created_at: current_time(),
       };
 
       transactionsStorage.insert(id, transaction);
@@ -232,13 +234,13 @@ export default Canister({
     [PointsPayload],
     Result(Message, Message),
     (payload) => {
-      const userOpt = usersStorage.get(payload.user_id);
+      const userResult = get_user(payload.user_id);
 
-      if ("None" in userOpt) {
-        return Err({ NotFound: "User not found." });
+      if ("Err" in userResult) {
+        return userResult; // Return error if user not found
       }
 
-      let user = userOpt.Some;
+      let user = userResult.Ok;
 
       if (user.points >= payload.points) {
         user.points -= payload.points;
@@ -254,7 +256,7 @@ export default Canister({
 
   // Get Transaction History
   get_transaction_history: query(
-    [nat64],
+    [text],
     Result(Vec(Transaction), Message),
     (user_id) => {
       const transactions = transactionsStorage
@@ -274,20 +276,20 @@ export default Canister({
   ),
 
   // Get User Balance
-  get_user_balance: query([nat64], Result(nat64, Message), (user_id) => {
-    const userOpt = usersStorage.get(user_id);
-    if ("None" in userOpt) {
-      return Err({ NotFound: "User not found." });
+  get_user_balance: query([text], Result(nat64, Message), (user_id) => {
+    const userResult = get_user(user_id);
+    if ("Err" in userResult) {
+      return userResult; // Return error if user not found
     }
-    return Ok(userOpt.Some.balance);
+    return Ok(userResult.Ok.balance);
   }),
 
   // Get User Points
-  get_user_points: query([nat64], Result(nat64, Message), (user_id) => {
-    const userOpt = usersStorage.get(user_id);
-    if ("None" in userOpt) {
-      return Err({ NotFound: "User not found." });
+  get_user_points: query([text], Result(nat64, Message), (user_id) => {
+    const userResult = get_user(user_id);
+    if ("Err" in userResult) {
+      return userResult; // Return error if user not found
     }
-    return Ok(userOpt.Some.points);
+    return Ok(userResult.Ok.points);
   }),
 });
