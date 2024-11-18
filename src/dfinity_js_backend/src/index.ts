@@ -43,6 +43,14 @@ const Transaction = Record({
   created_at: text,
 });
 
+ // a new Record type for the transaction response
+ const TransactionResponse = Record({
+  transaction: Transaction,
+  new_balance: nat64,
+  points_earned: nat64,
+  message: text
+});
+
 // Message Enum for Error and Success Handling
 const Message = Variant({
   Success: text,
@@ -81,7 +89,7 @@ const DepositPayload = Record({
 
 // Storage initialization
 const usersStorage = StableBTreeMap(0, text, User);
-const transactionsStorage = StableBTreeMap(0, text, Transaction);
+const transactionsStorage = StableBTreeMap(2, text, Transaction);
 
 // Helper Function for Current Time
 function current_time(): nat64 {
@@ -128,9 +136,11 @@ export default Canister({
     }
 
     const id = uuidv4(); // Generate a unique ID
+
+    // Create a username using the first name and last name
     const username = `${payload.first_name.toLowerCase()}${payload.last_name
       .toLowerCase()
-      .substring(0, 10)}`; // Create a username
+      .substring(0, 10)}`;
 
     const user = {
       id,
@@ -146,6 +156,17 @@ export default Canister({
 
     usersStorage.insert(id, user);
     return Ok(user);
+  }),
+
+  // Function to fetc all users
+  fetch_all_users: query([], Result(Vec(User), Message), () => {
+    const users = usersStorage.values();
+
+    if (users.length === 0) {
+      return Err({ NotFound: "No users found." });
+    }
+
+    return Ok(users);
   }),
 
   // Deposit Funds Function
@@ -164,68 +185,92 @@ export default Canister({
 
       const user = userOpt.Some;
       user.balance += payload.amount;
+
+      const newBlance = user.balance;
+
+
       usersStorage.insert(payload.user_id, user);
 
       return Ok({
-        Success: `Deposited ${payload.amount} units of currency to user ${payload.user_id}`,
+        Success: `Deposited ${payload.amount} units of currency to user ${payload.user_id} new balance is ${newBlance}`,
       });
     }
   ),
 
-  // Send Transaction Function
-  send_transaction: update(
-    [TransactionPayload],
-    Result(Transaction, Message),
-    (payload) => {
+
+
+// Then modify the send_transaction function
+send_transaction: update(
+  [TransactionPayload],
+  Result(TransactionResponse, Message),
+  (payload) => {
       if (payload.amount === 0n) {
-        return Err({
-          InvalidPayload: "Amount must be greater than 0.",
-        });
+          return Err({
+              InvalidPayload: "Amount must be greater than 0.",
+          });
       }
 
       const fromUserOpt = usersStorage.get(payload.from_user_id);
       const toUserOpt = usersStorage.get(payload.to_user_id);
 
       if ("None" in fromUserOpt) {
-        return Err({ NotFound: "Sender not found." });
+          return Err({ NotFound: "Sender not found." });
       }
 
       if ("None" in toUserOpt) {
-        return Err({ NotFound: "Recipient not found." });
+          return Err({ NotFound: "Recipient not found." });
+      }
+
+      // Ensure sender and recipient are not the same
+      if (payload.from_user_id === payload.to_user_id) {
+          return Err({
+              InvalidPayload: "Sender and recipient cannot be the same.",
+          });
       }
 
       let from_user = fromUserOpt.Some;
       let to_user = toUserOpt.Some;
 
+      // Ensure sender has sufficient balance
       if (from_user.balance < payload.amount) {
-        return Err({ Error: "Insufficient balance." });
+          return Err({ Error: "Insufficient balance." });
       }
 
+      // Process the transaction
       from_user.balance -= payload.amount;
       to_user.balance += payload.amount;
 
+      // Calculate points
+      const points = payload.amount / 10n; // Award 1 point for every 10 units of currency
+      from_user.points += points;
+
+      // Update storage
       usersStorage.insert(from_user.id, from_user);
       usersStorage.insert(to_user.id, to_user);
 
+      // Create and store transaction record
       const id = uuidv4();
       const transaction = {
-        id,
-        from_user_id: payload.from_user_id,
-        to_user_id: payload.to_user_id,
-        amount: payload.amount,
-        created_at: current_time().toString(),
+          id,
+          from_user_id: payload.from_user_id,
+          to_user_id: payload.to_user_id,
+          amount: payload.amount,
+          created_at: current_time().toString(),
       };
 
       transactionsStorage.insert(id, transaction);
 
-      // Award points for the transaction
-      const points = payload.amount / 10n; // Award 1 point for every 10 units of currency
-      from_user.points += points;
-      usersStorage.insert(from_user.id, from_user);
-
-      return Ok(transaction);
-    }
-  ),
+      // Return comprehensive response
+      return Ok({
+          transaction: transaction,
+          new_balance: from_user.balance,
+          points_earned: points,
+          message: `Successfully transferred ${payload.amount.toString()} units. 
+                   New balance: ${from_user.balance.toString()} units. 
+                   Points earned: ${points.toString()}`
+      });
+  }
+),
 
   // Redeem Points Function
   redeem_points: update(
@@ -242,9 +287,12 @@ export default Canister({
 
       if (user.points >= payload.points) {
         user.points -= payload.points;
+
+        const newPointsBalance = user.points;
+
         usersStorage.insert(payload.user_id, user);
         return Ok({
-          Success: `Redeemed ${payload.points} points from user ${payload.user_id}`,
+          Success: `Redeemed ${payload.points} points from user ${payload.user_id} new points balance is ${newPointsBalance}`,
         });
       } else {
         return Err({ Error: "Insufficient points." });
@@ -254,7 +302,7 @@ export default Canister({
 
   // Get Transaction History
   get_transaction_history: query(
-    [nat64],
+    [text],
     Result(Vec(Transaction), Message),
     (user_id) => {
       const transactions = transactionsStorage
@@ -274,20 +322,28 @@ export default Canister({
   ),
 
   // Get User Balance
-  get_user_balance: query([nat64], Result(nat64, Message), (user_id) => {
+  get_user_balance: query([text], Result(Message, Message), (user_id) => {
     const userOpt = usersStorage.get(user_id);
+
     if ("None" in userOpt) {
       return Err({ NotFound: "User not found." });
     }
-    return Ok(userOpt.Some.balance);
+
+    return Ok({
+      Success: `User balance is: ${userOpt.Some.balance.toString()} units`,
+    });
   }),
 
-  // Get User Points
-  get_user_points: query([nat64], Result(nat64, Message), (user_id) => {
+  // Function to get total user points
+  get_user_points: query([text], Result(Message, Message), (user_id) => {
     const userOpt = usersStorage.get(user_id);
+
     if ("None" in userOpt) {
       return Err({ NotFound: "User not found." });
     }
-    return Ok(userOpt.Some.points);
+
+    return Ok({
+      Success: `User points are: ${userOpt.Some.points.toString()}`,
+    });
   }),
 });
